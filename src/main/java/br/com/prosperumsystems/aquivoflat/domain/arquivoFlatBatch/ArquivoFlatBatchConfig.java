@@ -5,6 +5,7 @@ import br.com.prosperumsystems.aquivoflat.model.Posicao;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
 import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.StepExecutionListener;
 import org.springframework.batch.core.annotation.BeforeStep;
 import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.core.job.builder.JobBuilder;
@@ -16,16 +17,24 @@ import org.springframework.batch.item.file.FlatFileItemWriter;
 import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
 import org.springframework.batch.item.file.builder.FlatFileItemWriterBuilder;
 import org.springframework.batch.item.file.transform.LineAggregator;
+import org.springframework.batch.item.support.CompositeItemProcessor;
+import org.springframework.batch.item.support.builder.CompositeItemProcessorBuilder;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 @Configuration
 public class ArquivoFlatBatchConfig {
@@ -39,12 +48,14 @@ public class ArquivoFlatBatchConfig {
 
     @Bean
     public Step flatFileStep(JobRepository jobRepository, PlatformTransactionManager transactionManager,
-                             @Qualifier("PosicaoVerificaHeaderProcessor") ItemProcessor<Posicao, Posicao> posicaoVerificaHeaderProcessor) {
+                             @Qualifier("PosicaoVerificaHeaderProcessor") ItemProcessor<Posicao, Posicao> posicaoVerificaHeaderProcessor,
+                             @Qualifier("CountLinesStepListener") StepExecutionListener countLinesStepListener) {
         return new StepBuilder("flatFileStep", jobRepository)
                 .<Posicao, Posicao>chunk(100, transactionManager)
                 .reader(posicaoReader())
-                .processor(posicaoVerificaHeaderProcessor)
+                .processor(compositeItemProcessor())
                 .writer(flatFileWriter())
+                .listener(countLinesStepListener)
                 .build();
     }
 
@@ -58,6 +69,15 @@ public class ArquivoFlatBatchConfig {
                 .names("dataMovimento", "documento", "nome", "nuProduto", "nomeFundoInvestimento", "cnpjFundo", "operacao", "dataEfetivacao", "dataConversao", "qtdeCotas", "valorInicial", "saldoBruto", "saldoLiquido", "cotaInicial", "cotaAtual", "iof", "ir", "formaLiquidacao", "agencia", "operacaoProduto", "contaDv")
                 .targetType(Posicao.class)
                 .linesToSkip(1) // skip header
+                .build();
+    }
+
+    @Bean
+    public CompositeItemProcessor<Posicao, Posicao> compositeItemProcessor(
+            @Qualifier("CountItensByAgenciaProcessor") ItemProcessor<Posicao, Posicao> countItensByAgenciaProcessor,
+        @Qualifier("PosicaoVerificaHeaderProcessor") ItemProcessor<Posicao, Posicao> verificaHeaderProcessor) {
+        return new CompositeItemProcessorBuilder<Posicao, Posicao>()
+                .delegates(List.of(verificaHeaderProcessor, countItensByAgenciaProcessor))
                 .build();
     }
 
@@ -179,7 +199,7 @@ class PosicaoVerificaHeaderProcessor implements ItemProcessor<Posicao, Posicao> 
         if (deveAvancarPagina(posicao.getAgencia())){
             nextPage();
         }
-        Long qtdTotalItens = stepExecution.getReadCount(); // TODO: adicionar o tatal de itens lidos no Step context ao executar o reader do step
+        Long qtdTotalItens = stepExecution.getExecutionContext().getLong("totalRegistros");
         FlatFilePaginationInfo paginationInfo = new FlatFilePaginationInfo(
             getCountPages(),
             getCountItensPage(),
@@ -248,5 +268,73 @@ class PosicaoVerificaHeaderProcessor implements ItemProcessor<Posicao, Posicao> 
 
     private void resetCountItensPage() {
         stepExecution.getExecutionContext().putLong("countItensPage", 1L);
+    }
+}
+
+@Component("CountLinesStepListener")
+@StepScope
+class CountLinesStepListener implements StepExecutionListener {
+    private final Resource resource;
+    public CountLinesStepListener(Resource resource) {
+        this.resource = resource;
+    }
+
+    @Override
+    public void beforeStep(StepExecution stepExecution) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(resource.getInputStream()))) {
+            long lines = reader.lines().count() - 1; // -1 para ignorar o header
+            stepExecution.getExecutionContext().putLong("totalRegistros", lines);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+@Component("PosicaoVerificaHeaderProcessor")
+@StepScope
+class PosicaoDefineHeaderAndFooterProcessor implements ItemProcessor<Posicao, Posicao> {
+    private StepExecution stepExecution;
+    private Long QUANTIDADE_ITENS_POR_PAGINA = 10L;
+
+    @BeforeStep
+    public void saveStepExecution(StepExecution stepExecution) {
+        this.stepExecution = stepExecution;
+    }
+
+    @Override
+    public Posicao process(Posicao posicao) throws Exception {
+        Long qtdTotalItens = stepExecution.getExecutionContext().getLong("totalRegistros");
+        FlatFilePaginationInfo paginationInfo = posicao.getPaginationInfo();
+
+        posicao.setPaginationInfo(paginationInfo);
+        return posicao;
+    }
+}
+
+@Component("CountItensByAgenciaProcessor")
+@StepScope
+class CountItensByAgenciaProcessor implements ItemProcessor<Posicao, Posicao> {
+    private StepExecution stepExecution;
+
+    @BeforeStep
+    public void saveStepExecution(StepExecution stepExecution) {
+        this.stepExecution = stepExecution;
+    }
+
+    @Override
+    public Posicao process(Posicao posicao) throws Exception {
+        if(!stepExecution.getExecutionContext().containsKey("listaContadorByAgencia")) {;
+            stepExecution.getExecutionContext().put("listaContadorByAgencia", new HashMap<String, Long>());
+        }
+        Map<String, Long> listaContadorByAgencia = (Map<String, Long>) stepExecution.getExecutionContext().get("listaContadorByAgencia");
+        String agencia = posicao.getAgencia();
+        if(!listaContadorByAgencia.containsKey(agencia)) {
+            listaContadorByAgencia.put(agencia, 0L);
+        }
+        Long contador = listaContadorByAgencia.get(agencia);
+        contador++;
+        listaContadorByAgencia.put(agencia, contador);
+        stepExecution.getExecutionContext().put("listaContadorByAgencia", listaContadorByAgencia);
+        return posicao;
     }
 }
